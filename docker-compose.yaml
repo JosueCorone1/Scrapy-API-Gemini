@@ -1,0 +1,9 @@
+services:
+  instagram-scraper:
+    build: .
+    volumes:
+      - ./output:/app/output
+    environment:
+      - INSTAGRAM_COOKIES=${INSTAGRAM_COOKIES:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}

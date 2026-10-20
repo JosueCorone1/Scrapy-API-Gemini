@@ -1,0 +1,14 @@
+# Private Instagram session credentials
+/instagram_cookies.py
+
+# Generated exports and downloaded media
+/output/
+
+# Python virtual environments and generated files
+/.venv/
+/venv/
+/env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
