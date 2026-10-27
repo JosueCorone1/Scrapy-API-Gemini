@@ -38,21 +38,18 @@ Four upstream surfaces, all from one anonymous session:
     (ssr.py), used where the matching query is itself gated
     (PolarisExploreLocationsContainerQuery answers 401 when called).
 
-FALLBACK: a thread whose direct egress is refused (401/403/429 on a surface
-that normally answers, or HTML where JSON was expected) moves to a
-residential exit (config.INSTAGRAM_FALLBACK_PROXY_COUNTRY) for
-INSTAGRAM_DIRECT_COOLDOWN seconds. If residential exits start being
-challenged too, the next step is the patchright pattern (g2 pool): warm a
-Chrome on https://www.instagram.com/ and run the same POSTs through the
-in-page fetch. Not built: dead code while plain HTTP works.
+BLOCK HANDLING: a 429 honors Retry-After (or the configured cooldown), and
+subsequent requests in this process are stopped during that cooldown. A
+403/429 is not retried on another identity or network route. A configured
+INSTAGRAM_PROXY, if present, is a fixed route chosen by the operator.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   InstagramUpstreamError   transport failure / 5xx                  — retryable
   InstagramExecutionError  GraphQL "execution error" with no data    — retryable
-  InstagramGated           a login wall on a surface (403/401/redirect
-                           to /accounts/login/) — callers fall back to
-                           another surface; otherwise 502
-  InstagramBlocked         403 / 429 / HTML instead of JSON          — retryable on a new exit
+  InstagramGated           a login wall on a surface (401/redirect to
+                           /accounts/login/) — callers may try a public
+                           surface; otherwise 502
+  InstagramBlocked         403 / 429 / HTML instead of JSON          — stop
   InstagramBadRequest      upstream 400                              — never retried
   InstagramNotFound        unknown user / post / tag / location      — never retried
 """
@@ -64,6 +61,8 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlparse
 
@@ -77,7 +76,7 @@ except ImportError:  # standalone package: the same four bases, locally
         """Transport failure or 5xx — retryable."""
 
     class Blocked(UpstreamError):
-        """Anti-bot challenge / 403 / 429 — retryable after a fresh exit."""
+        """Anti-bot challenge / 403 / 429 — stop the current request flow."""
 
     class BadRequest(Exception):
         """Upstream rejected the params — never retried."""
@@ -103,6 +102,9 @@ GRAPHQL_TIMEOUT = 30
 MOBILE_TIMEOUT = 30
 PAGE_TIMEOUT = 45          # explore pages are 1-2 MB
 FANOUT_WORKERS = 4
+_request_lock = threading.Lock()
+_next_request_at = 0.0
+_requests_blocked_until = 0.0
 
 PAGE_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -140,7 +142,11 @@ class InstagramGated(InstagramUpstreamError):
 
 
 class InstagramBlocked(InstagramUpstreamError, Blocked):
-    """403 / 429, or HTML where JSON was expected — retryable on a new exit."""
+    """403 / 429, or HTML where JSON was expected; stops the current scan."""
+
+
+class InstagramRateLimited(InstagramBlocked):
+    """HTTP 429 or a local cooldown; no further request is sent."""
 
 
 class InstagramBadRequest(BadRequest):
@@ -165,8 +171,9 @@ def _token(n):
 
 
 def _proxy_for_thread():
-    via_proxy = getattr(_local, "proxy_until", 0) > time.time()
-    return via_proxy, (config.instagram_proxy() or (config.instagram_fallback_proxy() if via_proxy else None))
+    """Use only the configured fixed proxy, if the operator supplied one."""
+    proxy = config.instagram_proxy()
+    return proxy is not None, proxy
 
 
 def _new_session(proxy):
@@ -259,15 +266,6 @@ def _drop_session():
                 pass
 
 
-def _escalate():
-    """Direct egress (or the current exit) was refused: run this thread
-    through a fresh residential exit for a while (no fallback configured =
-    just rebuild the sessions with new tokens)."""
-    if config.instagram_fallback_proxy() is not None:
-        _local.proxy_until = time.time() + config.INSTAGRAM_DIRECT_COOLDOWN
-    _drop_session()
-
-
 def dump_debug(name, text):
     """Write a raw response to $INSTAGRAM_DEBUG_DIR/<name>.txt."""
     dbg = os.environ.get("INSTAGRAM_DEBUG_DIR", "")
@@ -287,16 +285,56 @@ def _retrying(fn, no_retry=()):
             return fn()
         except no_retry:
             raise
-        except InstagramBlocked as e:
-            last = e
-            _escalate()
-        except InstagramUpstreamError as e:
-            last = e
+        except (InstagramBlocked, InstagramGated):
+            raise
+        except InstagramUpstreamError as exc:
+            last = exc
             _drop_session()
         if attempt < config.MAX_RETRIES:
             time.sleep(config.RETRY_BACKOFF * attempt)
     raise last
 
+
+def _retry_after_seconds(value):
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def paced_request(session, method, url, **kwargs):
+    """Serialize requests and honor Retry-After after an HTTP 429."""
+    global _next_request_at, _requests_blocked_until
+    with _request_lock:
+        now = time.monotonic()
+        cooldown = _requests_blocked_until - now
+        if cooldown > 0:
+            raise InstagramRateLimited(
+                f"HTTP 429 cooldown active for {cooldown:.0f}s; request not sent"
+            )
+        wait = _next_request_at - now
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            response = getattr(session, method)(url, **kwargs)
+        finally:
+            _next_request_at = (
+                time.monotonic() + config.INSTAGRAM_REQUEST_INTERVAL_SECONDS
+            )
+        if response.status_code == 429:
+            delay = _retry_after_seconds(response.headers.get("Retry-After"))
+            if delay is None:
+                delay = config.INSTAGRAM_RATE_LIMIT_COOLDOWN_SECONDS
+            _requests_blocked_until = time.monotonic() + delay
+        return response
 
 def _is_gate(text):
     low = (text or "")[:2000].lower()
@@ -375,7 +413,9 @@ def graphql(name, retry_execution_errors=True, anonymous=False, **variables):
             "x-ig-app-id": WEB_APP_ID,
         }
         try:
-            resp = sess.post(url, data=body, headers=headers, timeout=GRAPHQL_TIMEOUT)
+            resp = paced_request(sess, "post", url, data=body, headers=headers, timeout=GRAPHQL_TIMEOUT)
+        except InstagramRateLimited:
+            raise
         except Exception as e:
             raise InstagramUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -418,11 +458,9 @@ def graphql(name, retry_execution_errors=True, anonymous=False, **variables):
 # ---- mobile app API --------------------------------------------------------------------
 
 def mobile(path, *, params=None, data=None):
-    """GET (or POST with `data`) https://i.instagram.com/api/v1/<path> as
-    the Android app, unsigned -> the JSON object. Login walls (403
-    login_required) raise InstagramGated so callers can fall back to a web
-    query; a 401 "Please wait" on a path that normally answers is treated
-    as a block and moves the thread to a fresh exit."""
+    """Request an Instagram mobile JSON endpoint. Login walls raise
+    InstagramGated so callers may try another public surface; 403/429 blocks
+    stop the current collection."""
     url = f"{MOBILE_SITE}/api/v1/{path.lstrip('/')}"
     label = path.strip("/").split("?")[0]
 
@@ -436,9 +474,11 @@ def mobile(path, *, params=None, data=None):
         }
         try:
             if data is not None:
-                resp = sess.post(url, data=data, params=params, headers=headers, timeout=MOBILE_TIMEOUT)
+                resp = paced_request(sess, "post", url, data=data, params=params, headers=headers, timeout=MOBILE_TIMEOUT)
             else:
-                resp = sess.get(url, params=params, headers=headers, timeout=MOBILE_TIMEOUT)
+                resp = paced_request(sess, "get", url, params=params, headers=headers, timeout=MOBILE_TIMEOUT)
+        except InstagramRateLimited:
+            raise
         except Exception as e:
             raise InstagramUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -501,7 +541,9 @@ def www_api(path, *, form, referer):
             "x-ig-d": "www",
         }
         try:
-            resp = sess.post(url, data=body, headers=headers, timeout=GRAPHQL_TIMEOUT)
+            resp = paced_request(sess, "post", url, data=body, headers=headers, timeout=GRAPHQL_TIMEOUT)
+        except InstagramRateLimited:
+            raise
         except Exception as e:
             raise InstagramUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -546,7 +588,9 @@ def www_json(path, *, params, label, referer=None, session_auth=False):
                 "x-requested-with": "XMLHttpRequest",
             })
         try:
-            resp = sess.get(url, params=params, headers=headers, timeout=GRAPHQL_TIMEOUT)
+            resp = paced_request(sess, "get", url, params=params, headers=headers, timeout=GRAPHQL_TIMEOUT)
+        except InstagramRateLimited:
+            raise
         except Exception as e:
             raise InstagramUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -581,7 +625,9 @@ def get_page(path, *, label):
     def once():
         sess = _session()
         try:
-            resp = sess.get(url, headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT, allow_redirects=True)
+            resp = paced_request(sess, "get", url, headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT, allow_redirects=True)
+        except InstagramRateLimited:
+            raise
         except Exception as e:
             raise InstagramUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -612,7 +658,9 @@ def get_redirect(path, *, label):
     def once():
         sess = _session()
         try:
-            resp = sess.get(url, headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT, allow_redirects=False)
+            resp = paced_request(sess, "get", url, headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT, allow_redirects=False)
+        except InstagramRateLimited:
+            raise
         except Exception as e:
             raise InstagramUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code

@@ -2,7 +2,7 @@
 
 Aplicación de escritorio pequeña para recopilar los datos de un perfil que la sesión actual puede consultar, guardar un informe JSON y, si el usuario lo solicita, enviar la biografía y las descripciones seleccionadas a Gemini para una lectura lingüística exploratoria.
 
-El programa guarda únicamente el **número** de seguidores y seguidos; no descarga las listas de cuentas. El análisis Big Five no es una prueba psicométrica, un diagnóstico ni una descripción fiable de la personalidad real de alguien.
+La aplicación ofrece un análisis lingüístico Big Five exploratorio y una sección de Ley de Benford. Esta última puede guardar las listas visibles de seguidores/seguidos y los conteos de cada perfil en CSV y JSON. El análisis Big Five no es una prueba psicométrica, un diagnóstico ni una descripción fiable de la personalidad real de alguien.
 
 ## Requisitos
 
@@ -43,7 +43,7 @@ Interfaz gráfica:
 python gui.py
 ```
 
-En la ventana escribe el @handle, el límite de publicaciones/reels y pulsa **Iniciar extracción**. La casilla de Gemini es opcional; si la activas, la ventana pide confirmación antes de enviar el texto.
+En la ventana escribe el @handle. La pestaña **Personalidad (Big Five)** conserva el flujo existente: allí eliges el límite de publicaciones/reels y puedes solicitar el análisis opcional de Gemini. En **Ley de Benford**, pulsa **Recopilar seguidores y seguidos**, selecciona el conjunto de conteos que deseas analizar y pulsa **Calcular ajuste**. Las tablas muestran la información disponible por perfil y un hover muestra sus detalles.
 
 También se puede ejecutar el flujo de consola:
 
@@ -67,11 +67,11 @@ python -m pip install -r requirements.txt
 
 El JSON se guarda como `output/instagram_report_<usuario>.json`. Incluye los metadatos disponibles del perfil, los conteos de seguidores y seguidos, el contenido recopilado, hashtags, menciones, fecha, URL y métricas cuando Instagram las entrega. Las fotos y videos seleccionados se guardan en `output/media/<usuario>/posts/` o `output/media/<usuario>/reels/`.
 
-El informe diferencia la cantidad solicitada de la cantidad recopilada. Un estado `limit_reached` indica que se alcanzó el límite configurado; no significa que se hayan descargado todas las publicaciones de la cuenta. Un conteo ausente o una métrica `null` significa que la respuesta no proporcionó ese dato.
+El informe diferencia la cantidad solicitada de la cantidad recopilada. Un estado `limit_reached` indica que se alcanzó el límite configurado; no significa que se hayan descargado todas las publicaciones de la cuenta. La sección Benford guarda `output/benford_scan_<usuario>.csv` y `output/benford_scan_<usuario>.json`; estos incluyen el estado de paginación y los conteos que la sesión pudo consultar. Un conteo ausente o una métrica `null` significa que la respuesta no proporcionó ese dato.
 
 ## Cómo funciona
 
-- **Interfaz:** Tkinter, incluido en la biblioteca estándar de Python.
+- **Interfaz:** Tkinter, incluido en la biblioteca estándar de Python; Matplotlib dibuja los tres gráficos de Benford.
 - **Solicitudes web:** `curl_cffi`, un cliente HTTP con una interfaz parecida a Requests. Se usa para las consultas web y para transferir medios; este repositorio no automatiza un navegador.
 - **Análisis opcional:** SDK oficial `google-genai` para llamar a Gemini y solicitar una respuesta JSON.
 - **Salida:** JSON local y archivos multimedia seleccionados.
@@ -82,7 +82,8 @@ Este proyecto no usa Scrapy, Selenium ni Playwright. Esas herramientas tienen ot
 
 - Usa la herramienta solo con perfiles y datos que tengas autorización para analizar y conforme a las reglas aplicables.
 - No intenta eludir controles de acceso. Los errores `401`/`login_required` indican que la sesión no tiene acceso a esa consulta; un `403`/`429` puede indicar una restricción temporal. Si aparece un `429`, detén las consultas y espera antes de probar de nuevo.
-- Solo recopila conteos de seguidores/seguidos, no las listas de handles. No descarga comentarios.
+- La sección Benford consulta listas visibles y conteos de perfil. Si aparece un 403/429 durante la recopilación, se detienen las solicitudes y se guarda lo reunido hasta ese momento en CSV/JSON; espera antes de reintentar. No cambia automáticamente de IP ni rota cookies.
+- La prueba chi-cuadrado y la Ley de Benford son exploratorias: el tamaño y los límites de las redes sociales, junto con la dependencia entre perfiles, pueden invalidar la interpretación estándar del p-valor. No permiten determinar por sí solas si una cuenta es orgánica o anómala.
 - La biografía y las descripciones se envían a Gemini únicamente si se solicita el análisis y se confirma el envío. El informe local guarda la respuesta del análisis, pero no la clave API.
 - El texto público no basta para inferir de forma fiable rasgos psicológicos. Las puntuaciones, si se generan, son aproximaciones especulativas de lenguaje y no deben usarse para decisiones de empleo, salud, educación, crédito o acceso a servicios.
 - No publiques informes que contengan nombres, descripciones, enlaces u otros datos personales sin autorización.
