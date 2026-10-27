@@ -4,23 +4,27 @@ Only data visible to the current Instagram session is collected. Selected
 post/reel media files and the report are written to output/.
 """
 import argparse
+import csv
 import json
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
 from instagram import refs
-from instagram.fetch import InstagramBlocked, InstagramGated
+from instagram.fetch import InstagramUpstreamError
 from instagram.media_download import download_content
 from instagram.users import (
+    get_followers,
+    get_following,
     get_posts,
     get_profile,
     get_reels,
+    resolve as resolve_profile,
 )
 from gemini_analysis import analyze_texts
 
-PAGE_DELAY_SECONDS = 0.7
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 HASHTAG_RE = re.compile(r"(?<![\w])#[\w]+", re.UNICODE)
@@ -112,7 +116,6 @@ def collect_all_pages(fetch_page, *, item_key, count_key, label, limit=None, pro
 
         seen_cursors.add(pending_cursor)
         cursor = pending_cursor
-        time.sleep(PAGE_DELAY_SECONDS)
 
     result = dict(first_page or {})
     result[item_key] = items
@@ -426,6 +429,170 @@ def run_export(raw_username, limit, *, gemini_consent=None, progress=None):
     report_progress(f"Informe guardado: {path}")
     return report, path
 
+
+
+def run_benford_scan(raw_username, *, progress=None):
+    """Collect visible relationships and individual profile follower counts.
+
+    Partial results are preserved. A login gate or 403/429 stops subsequent
+    requests instead of retrying or changing the session/network route.
+    """
+    target = refs.resolve_user(raw_username)
+    if not target.get("username"):
+        raise ValueError("Escribe el @handle de Instagram, no un ID numérico.")
+    if not config.instagram_cookies():
+        raise RuntimeError(
+            "Falta INSTAGRAM_COOKIES. Configura una cookie de tu propia sesión en .env."
+        )
+
+    username = target["username"]
+
+    def report_progress(message):
+        print(message)
+        if progress:
+            progress(message)
+
+    def collect(label, fetch_page):
+        report_progress(f"Consultando {label.lower()} visibles de @{username}...")
+        return collect_all_pages(
+            fetch_page,
+            item_key="users",
+            count_key="user_count",
+            label=label,
+            progress=progress,
+        )
+
+    followers = collect(
+        "Seguidores", lambda cursor: get_followers(target, cursor=cursor)
+    )
+    block_markers = ("429", "403", "login_required", "limitó temporalmente")
+    blocked = any(
+        marker in (followers.get("error") or "").lower()
+        for marker in block_markers
+    )
+
+    if blocked:
+        following = {
+            "users": [],
+            "user_count": 0,
+            "complete": False,
+            "status": "not_requested",
+            "error": "Consulta detenida para respetar el bloqueo o requisito de sesión.",
+        }
+    else:
+        following = collect(
+            "Seguidos", lambda cursor: get_following(target, cursor=cursor)
+        )
+        blocked = any(
+            marker in (following.get("error") or "").lower()
+            for marker in block_markers
+        )
+
+    unique_rows = {}
+    for rows in (followers.get("users", []), following.get("users", [])):
+        for row in rows:
+            key = str(row.get("id") or row.get("username") or "").lower()
+            if key:
+                unique_rows.setdefault(key, row)
+
+    enriched_by_key = {}
+    profile_rows = list(unique_rows.items())
+    interrupted = blocked
+    for index, (key, row) in enumerate(profile_rows, start=1):
+        enriched = dict(row)
+        if interrupted:
+            enriched["stats_error"] = (
+                "No consultado porque Instagram limitó la recopilación."
+            )
+            enriched_by_key[key] = enriched
+            continue
+
+        if index == 1 or index % 10 == 0 or index == len(profile_rows):
+            report_progress(
+                f"Consultando conteos de perfiles: {index}/{len(profile_rows)} "
+                f"(@{row.get('username') or key})..."
+            )
+        try:
+            profile = resolve_profile(
+                {"id": row.get("id"), "username": row.get("username")}
+            )
+            enriched.update({
+                "full_name": profile.get("full_name") or row.get("full_name"),
+                "follower_count": profile.get("follower_count"),
+                "following_count": profile.get("following_count"),
+                "is_private": profile.get("is_private", row.get("is_private")),
+                "is_verified": profile.get("is_verified", row.get("is_verified")),
+                "link": profile.get("link") or row.get("link"),
+            })
+            if (
+                enriched["follower_count"] is None
+                or enriched["following_count"] is None
+            ):
+                enriched["stats_error"] = (
+                    "Instagram no proporcionó ambos conteos del perfil."
+                )
+        except InstagramUpstreamError as exc:
+            enriched["follower_count"] = None
+            enriched["following_count"] = None
+            enriched["stats_error"] = f"Consulta detenida: {str(exc)[:180]}"
+            interrupted = True
+        except Exception as exc:
+            enriched["follower_count"] = None
+            enriched["following_count"] = None
+            enriched["stats_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+        enriched_by_key[key] = enriched
+
+    def enrich_rows(rows):
+        result_rows = []
+        for row in rows:
+            key = str(row.get("id") or row.get("username") or "").lower()
+            result_rows.append(enriched_by_key.get(key, dict(row)))
+        return result_rows
+
+    result = {
+        "target": username,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "followers": enrich_rows(followers.get("users", [])),
+        "following": enrich_rows(following.get("users", [])),
+        "collection": {
+            "followers": {
+                key: followers.get(key)
+                for key in ("complete", "status", "error", "pages_fetched")
+            },
+            "following": {
+                key: following.get(key)
+                for key in ("complete", "status", "error", "pages_fetched")
+            },
+            "metrics_interrupted": interrupted,
+        },
+    }
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = OUTPUT_DIR / f"benford_scan_{username}.csv"
+    json_path = OUTPUT_DIR / f"benford_scan_{username}.json"
+    fields = (
+        "relationship", "username", "full_name", "follower_count",
+        "following_count", "is_private", "is_verified", "link", "stats_error",
+    )
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for relationship in ("followers", "following"):
+            for row in result[relationship]:
+                writer.writerow({"relationship": relationship, **row})
+
+    result["files"] = {
+        "csv": str(csv_path.resolve()),
+        "json": str(json_path.resolve()),
+    }
+    with json_path.open("w", encoding="utf-8") as output:
+        json.dump(result, output, ensure_ascii=False, indent=2)
+
+    report_progress(
+        f"Extracción terminada: {len(result['followers'])} seguidores y "
+        f"{len(result['following'])} seguidos. CSV: {csv_path}"
+    )
+    return result
 
 def main():
     print("Exportador de perfil de Instagram")
