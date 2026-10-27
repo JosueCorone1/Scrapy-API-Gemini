@@ -23,7 +23,7 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Si PowerShell bloquea la activación del entorno, puedes omitir la activación y usar directamente `\.venv\Scripts\python.exe` en los comandos siguientes.
+Si PowerShell bloquea la activación del entorno, puedes omitir la activación y usar directamente `.\.venv\Scripts\python.exe` en los comandos siguientes.
 
 Edita `.env` con un editor de texto. El archivo debe estar junto a `main.py` y debe contener valores propios:
 
@@ -42,6 +42,14 @@ Interfaz gráfica:
 ```powershell
 python gui.py
 ```
+
+Si ya existe el entorno `.venv`, puedes iniciar sin activarlo y sin depender del comando `python` del sistema:
+
+```powershell
+.\.venv\Scripts\python.exe gui.py
+```
+
+`benford.py` contiene las funciones matemáticas que utiliza la interfaz. Ejecutarlo directamente no abre una ventana ni recopila datos.
 
 En la ventana escribe el @handle. La pestaña **Personalidad (Big Five)** conserva el flujo existente: allí eliges el límite de publicaciones/reels y puedes solicitar el análisis opcional de Gemini. En **Ley de Benford**, pulsa **Recopilar seguidores y seguidos**, selecciona el conjunto de conteos que deseas analizar y pulsa **Calcular ajuste**. Las tablas muestran la información disponible por perfil y un hover muestra sus detalles.
 
@@ -62,6 +70,29 @@ Si el SDK de Gemini no está instalado en el intérprete que ejecuta el proyecto
 ```powershell
 python -m pip install -r requirements.txt
 ```
+
+## Si aparece HTTP 429
+
+Un `429 Too Many Requests` indica un límite de solicitudes; no demuestra por sí solo que la cookie esté caducada. El servidor puede indicar una espera mediante `Retry-After` ([referencia HTTP](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/429)).
+
+- Detén la recopilación y respeta la espera indicada. El programa usa `Retry-After` cuando existe; si falta, aplica una pausa local de 900 segundos (15 minutos) por defecto. El bloqueo de Instagram puede durar más.
+- La pausa local se mantiene mientras el programa está abierto. Reiniciarlo borra ese temporizador local, pero no elimina el bloqueo del servidor.
+- Los errores `401`/`login_required` sí requieren revisar la sesión y su acceso al perfil. Configura `INSTAGRAM_COOKIES` solo en tu `.env` local; no compartas su contenido.
+- Benford consulta páginas de seguidores/seguidos y luego el perfil de cada cuenta encontrada; una cuenta con muchas relaciones puede generar muchas solicitudes. El límite de publicaciones de la otra pestaña no limita esa recopilación.
+- Ante un bloqueo se detienen las siguientes etapas de consulta y se guardan los datos parciales disponibles. Una muestra interrumpida o sin conteos no equivale a una extracción completa ni permite sacar conclusiones sobre el ajuste.
+
+## Comprobación local para la tarea
+
+Las pruebas usan respuestas simuladas y los ejemplos guardados en `instagram/fixtures/`; no necesitan cookies ni realizan consultas a Instagram o Gemini:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest tests instagram/test_parsers.py -q
+```
+
+Se comprueban el cálculo de Benford, la conservación de datos parciales, la clasificación de `429`, la espera y la detención de solicitudes. La prueba de esquemas del servicio alojado se omite cuando no existe `schema_fields`, que no forma parte de esta aplicación de escritorio.
+
+El modelo usa `P(d) = log10(1 + 1/d)`, nueve categorías y ocho grados de libertad ([Benford, NIST](https://xlinux.nist.gov/dads/HTML/benfordslaw.html); [chi-cuadrado, NIST](https://itl.nist.gov/div898/handbook/eda/section3/eda35f.htm)). Los conteos cero, negativos o ausentes se excluyen. La validez de la interpretación depende de la muestra y de los supuestos estadísticos; una ejecución sin errores no demuestra que se cumplan. El cumplimiento de una tarea universitaria debe contrastarse además con su enunciado.
 
 ## Datos y archivos generados
 

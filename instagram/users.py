@@ -126,9 +126,11 @@ def resolve(user):
 
 
 def _quiet(fn):
-    """Run an enrichment call; its failure must not fail the profile."""
+    """Ignore optional enrichment failures, but propagate request blocks."""
     try:
         return fn()
+    except InstagramBlocked:
+        raise
     except (InstagramUpstreamError, InstagramBadRequest, InstagramNotFound):
         return None
 
@@ -212,7 +214,7 @@ def get_posts(user, cursor=None):
         # The public web timeline works without cookies for public accounts;
         # Instagram gates requests that attach this session's cookies.
         posts, next_cursor, has_more = _web_posts(raw_user, cursor)
-    except (InstagramGated, InstagramBlocked):
+    except InstagramGated:
         posts, next_cursor, has_more = _app_posts(raw_user, cursor)
     if P.to_bool(raw_user.get("is_private")) and not posts:
         has_more = False
@@ -303,7 +305,7 @@ def get_reels(user, cursor=None):
         if cursor:
             raise InstagramBadRequest(INVALID_CURSOR)
         raise
-    except (InstagramGated, InstagramBlocked):
+    except InstagramGated:
         if cursor:
             raise
         reels, next_cursor, has_more = _web_reels(raw_user)

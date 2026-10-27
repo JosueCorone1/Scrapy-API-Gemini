@@ -13,7 +13,9 @@ from pathlib import Path
 
 import config
 from instagram import refs
-from instagram.fetch import InstagramUpstreamError
+from instagram.fetch import (
+    InstagramBlocked, InstagramGated, InstagramRateLimited, InstagramUpstreamError,
+)
 from instagram.media_download import download_content
 from instagram.users import (
     get_followers,
@@ -51,6 +53,7 @@ def collect_all_pages(fetch_page, *, item_key, count_key, label, limit=None, pro
     complete = False
     limited = False
     error = None
+    stop_requests = False
 
     while True:
         try:
@@ -58,7 +61,10 @@ def collect_all_pages(fetch_page, *, item_key, count_key, label, limit=None, pro
             if not isinstance(page, dict):
                 raise TypeError("Instagram devolvió una página no válida")
         except Exception as exc:
-            if isinstance(exc, InstagramGated):
+            stop_requests = isinstance(exc, (InstagramBlocked, InstagramGated))
+            if isinstance(exc, InstagramRateLimited):
+                error = str(exc)
+            elif isinstance(exc, InstagramGated):
                 error = (
                     "Instagram rechazó la sesión para esta lista (login_required/HTTP 401). "
                     "Renueva INSTAGRAM_COOKIES desde una sesión autorizada que pueda ver la lista."
@@ -123,6 +129,7 @@ def collect_all_pages(fetch_page, *, item_key, count_key, label, limit=None, pro
     result["pages_fetched"] = pages_fetched
     result["complete"] = complete
     result["limited"] = limited
+    result["stop_requests"] = stop_requests
     result["has_more"] = not complete
     result["next_cursor"] = pending_cursor if not complete and not limited else None
     result["status"] = (
@@ -308,6 +315,8 @@ def run_export(raw_username, limit, *, gemini_consent=None, progress=None):
     report_progress(f"Consultando @{username}...")
     try:
         profile = get_profile(user)
+    except InstagramRateLimited as exc:
+        raise SystemExit(str(exc)) from None
     except InstagramBlocked as exc:
         detail = str(exc)
         if "429" in detail:
@@ -330,11 +339,18 @@ def run_export(raw_username, limit, *, gemini_consent=None, progress=None):
         item_key="posts", count_key="post_count", label="Publicaciones", limit=limit,
         progress=progress,
     )
-    reels = collect_all_pages(
-        lambda cursor: get_reels(user, cursor=cursor),
-        item_key="reels", count_key="reel_count", label="Reels", limit=limit,
-        progress=progress,
-    )
+    if posts["stop_requests"]:
+        reels = {
+            "reels": [], "complete": False, "status": "not_requested",
+            "stop_requests": True,
+            "error": "Consulta detenida tras el bloqueo o requisito de sesión en publicaciones.",
+        }
+    else:
+        reels = collect_all_pages(
+            lambda cursor: get_reels(user, cursor=cursor),
+            item_key="reels", count_key="reel_count", label="Reels", limit=limit,
+            progress=progress,
+        )
     records = [_content_record(row, "publicación") for row in posts["posts"]]
     records.extend(_content_record(row, "reel") for row in reels["reels"])
     unique_content = []
@@ -347,8 +363,16 @@ def run_export(raw_username, limit, *, gemini_consent=None, progress=None):
         unique_content.append(row)
     unique_content.sort(key=lambda row: row.get("date") or "", reverse=True)
     content = unique_content[:limit]
-    report_progress("Descargando fotos y videos seleccionados...")
-    download_content(username, content, OUTPUT_DIR)
+    if posts["stop_requests"] or reels["stop_requests"]:
+        report_progress("Recopilación detenida; guardando los datos parciales sin más descargas.")
+        for item in content:
+            item["media_downloads"] = {
+                "status": "not_requested", "files": [],
+                "error": "Descarga omitida tras el bloqueo o requisito de sesión de Instagram.",
+            }
+    else:
+        report_progress("Descargando fotos y videos seleccionados...")
+        download_content(username, content, OUTPUT_DIR)
     for item in content:
         status = (item.get("media_downloads") or {}).get("status", "unavailable")
         print(f"Medios de {item.get('url') or item.get('id')}: {status}")
@@ -465,11 +489,7 @@ def run_benford_scan(raw_username, *, progress=None):
     followers = collect(
         "Seguidores", lambda cursor: get_followers(target, cursor=cursor)
     )
-    block_markers = ("429", "403", "login_required", "limitó temporalmente")
-    blocked = any(
-        marker in (followers.get("error") or "").lower()
-        for marker in block_markers
-    )
+    blocked = followers["stop_requests"]
 
     if blocked:
         following = {
@@ -483,10 +503,7 @@ def run_benford_scan(raw_username, *, progress=None):
         following = collect(
             "Seguidos", lambda cursor: get_following(target, cursor=cursor)
         )
-        blocked = any(
-            marker in (following.get("error") or "").lower()
-            for marker in block_markers
-        )
+        blocked = following["stop_requests"]
 
     unique_rows = {}
     for rows in (followers.get("users", []), following.get("users", [])):
@@ -588,8 +605,18 @@ def run_benford_scan(raw_username, *, progress=None):
     with json_path.open("w", encoding="utf-8") as output:
         json.dump(result, output, ensure_ascii=False, indent=2)
 
+    collection = result["collection"]
+    if collection["metrics_interrupted"]:
+        completion = "Recopilación interrumpida; se guardaron los datos parciales"
+    elif not (
+        collection["followers"].get("complete")
+        and collection["following"].get("complete")
+    ):
+        completion = "Recopilación incompleta; se guardaron los datos disponibles"
+    else:
+        completion = "Recopilación completada"
     report_progress(
-        f"Extracción terminada: {len(result['followers'])} seguidores y "
+        f"{completion}: {len(result['followers'])} seguidores y "
         f"{len(result['following'])} seguidos. CSV: {csv_path}"
     )
     return result

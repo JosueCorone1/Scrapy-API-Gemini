@@ -453,6 +453,13 @@ class ExporterWindow:
             f"Estado Gemini: {analysis.get('status', 'no disponible')}",
             f"Informe: {path}",
         ]
+        collection = content.get("collection") or {}
+        interrupted = False
+        for key, label in (("posts", "Publicaciones"), ("reels", "Reels")):
+            details = collection.get(key) or {}
+            if details.get("error"):
+                interrupted = True
+                lines.append(f"{label}: {details['error']}")
         result = analysis.get("result") or {}
         if result:
             lines.append("\nAnálisis lingüístico exploratorio:")
@@ -469,7 +476,10 @@ class ExporterWindow:
 
         self._set_text(self.summary, "\n".join(lines))
         self._set_text(self.json_view, json.dumps(report, ensure_ascii=False, indent=2))
-        self.status.set("Proceso terminado.")
+        self.status.set(
+            "Recopilación interrumpida; consulta el detalle en el resumen."
+            if interrupted else "Proceso terminado."
+        )
         self._set_busy(False)
         self.open_button.configure(state="normal")
         self.mode_notebook.select(self.personality_page)
@@ -486,8 +496,19 @@ class ExporterWindow:
         self._analyze_benford()
         files = data.get("files") or {}
         csv_path = files.get("csv")
+        collection = data.get("collection") or {}
+        follower_status = collection.get("followers") or {}
+        following_status = collection.get("following") or {}
+        complete = (
+            follower_status.get("complete")
+            and following_status.get("complete")
+            and not collection.get("metrics_interrupted")
+        )
+        label = "Recopilación completada" if complete else (
+            "Recopilación interrumpida o incompleta; datos disponibles guardados"
+        )
         status = (
-            f"Recopilación finalizada para @{data.get('target')}: "
+            f"{label} para @{data.get('target')}: "
             f"{len(followers)} seguidores y {len(following)} seguidos."
         )
         if csv_path:

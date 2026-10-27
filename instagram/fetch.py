@@ -318,7 +318,8 @@ def paced_request(session, method, url, **kwargs):
         cooldown = _requests_blocked_until - now
         if cooldown > 0:
             raise InstagramRateLimited(
-                f"HTTP 429 cooldown active for {cooldown:.0f}s; request not sent"
+                f"Instagram limitó las solicitudes (HTTP 429). "
+                f"Quedan {cooldown:.0f} s de pausa local; no se envió otra solicitud."
             )
         wait = _next_request_at - now
         if wait > 0:
@@ -334,6 +335,15 @@ def paced_request(session, method, url, **kwargs):
             if delay is None:
                 delay = config.INSTAGRAM_RATE_LIMIT_COOLDOWN_SECONDS
             _requests_blocked_until = time.monotonic() + delay
+            response.close()
+            # Classify the status before reading body text: a 429 may also say
+            # "please wait a few minutes", which is not proof of a bad cookie.
+            raise InstagramRateLimited(
+                f"Instagram limitó las solicitudes (HTTP 429). "
+                f"Espera al menos {delay:.0f} s antes de reintentar; "
+                "el bloqueo del servidor puede durar más. "
+                "Este error no confirma que la cookie sea incorrecta."
+            )
         return response
 
 def _is_gate(text):
